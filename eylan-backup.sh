@@ -29,7 +29,7 @@ old_timer_unit() { printf '%s\n' '[Unit]' 'Description=Hourly Eylan backup' '[Ti
 timer_unit() { printf '%s\n' '[Unit]' 'Description=Hourly Eylan backup' '[Timer]' 'OnActiveSec=1h' 'OnUnitInactiveSec=1h' 'Unit=eylan-backup.service' '[Install]' 'WantedBy=timers.target'; }
 
 setup() {
-    need systemctl install openssl gpg python3 curl runuser pg_dump pg_restore psql createdb flock stat mktemp tar cmp cp mv chmod bash grep
+    need systemctl install openssl gpg python3 curl runuser pg_dump pg_restore psql createdb flock stat mktemp tar cmp cp mv rm chmod bash grep
     local service=/etc/systemd/system/eylan-backup.service timer=/etc/systemd/system/eylan-backup.timer
     local token chat dropins fragment dir name unit
     for dir in "$CONFIG" "$BASE"; do
@@ -62,31 +62,97 @@ setup() {
         if systemctl is-active --quiet eylan-backup.service; then fail 'Backup service is active; retry after it finishes.'; fi
         printf '%s\n' 'Update the executable and timer? Existing key, credentials, database and backups will not be changed.'
         confirm
-        systemctl stop eylan-backup.timer || fail 'Could not stop timer; no files were replaced.'
-        (
-            local staged old staged_timer old_timer
-            staged=$(mktemp "${SELF}.new.XXXXXXXX")
-            staged_timer=''
-            trap 'rm -f -- "$staged" ${staged_timer:+"$staged_timer"}' EXIT
-            install -m 700 -- "$0" "$staged"
+            local staged='' staged_timer='' old='' old_timer='' rollback_file=''
+            local timer_state='' service_state='' transaction=0 self_changed=0 timer_changed=0 lock_released=0
+            update_cleanup() {
+                local rc=$? rollback_failed=0 file
+                trap - EXIT
+                trap '' INT TERM HUP
+                set +e
+                if (( rc != 0 && transaction )); then
+                    if (( lock_released )); then
+                        exec 9>/run/lock/eylan-backup.lock && flock -n 9 || rollback_failed=1
+                        service_state=$(systemctl show --property=ActiveState --value eylan-backup.service) || rollback_failed=1
+                        [[ $service_state == inactive || $service_state == failed ]] || rollback_failed=1
+                    fi
+                    if (( rollback_failed )); then
+                        printf 'Error: Backup lock unavailable or service active; automatic rollback skipped. Restore retained copies after other operations finish, reload systemd, and restore timer state (%s). Executable: %s; timer: %s\n' "$timer_state" "$old" "${old_timer:-unchanged}" >&2
+                    else
+                        systemctl stop eylan-backup.timer || rollback_failed=1
+                        if (( self_changed )); then
+                            rollback_file=$(mktemp "${SELF}.rollback.XXXXXXXX") &&
+                                cp -p -- "$old" "$rollback_file" &&
+                                mv -f -- "$rollback_file" "$SELF" || rollback_failed=1
+                        fi
+                        if (( timer_changed )); then
+                            rollback_file=$(mktemp "${timer}.rollback.XXXXXXXX") &&
+                                cp -p -- "$old_timer" "$rollback_file" &&
+                                mv -f -- "$rollback_file" "$timer" || rollback_failed=1
+                        fi
+                        systemctl daemon-reload || rollback_failed=1
+                        if (( ! rollback_failed )) && [[ $timer_state == active ]]; then
+                            exec 9>&- || rollback_failed=1
+                            if (( ! rollback_failed )); then
+                                systemctl start eylan-backup.timer || rollback_failed=1
+                            fi
+                        fi
+                        if (( rollback_failed )); then
+                            printf 'Error: Rollback incomplete; timer may be stopped. Restore the retained copies manually, run systemctl daemon-reload, and restore timer state (%s). Executable: %s; timer: %s\n' "$timer_state" "$old" "${old_timer:-unchanged}" >&2
+                        else
+                            printf '%s\n' 'Update failed; previous files and timer state restored.' >&2
+                        fi
+                    fi
+                fi
+                for file in "$staged" "$staged_timer" "$rollback_file"; do
+                    if [[ -n $file ]] && ! rm -f -- "$file"; then
+                        printf 'Error: Could not remove temporary file: %s\n' "$file" >&2
+                        rc=1
+                    fi
+                done
+                exit "$rc"
+            }
+            trap update_cleanup EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            trap 'exit 129' HUP
+            staged=$(mktemp "${SELF}.new.XXXXXXXX") || fail 'Cannot stage executable.'
+            install -m 700 -- "$0" "$staged" || fail 'Cannot stage executable.'
             bash -n "$staged" || fail 'Downloaded script has invalid Bash syntax.'
-            old=$(mktemp "${SELF}.previous.XXXXXXXX")
-            cp -p -- "$SELF" "$old"
+            old=$(mktemp "${SELF}.previous.XXXXXXXX") || fail 'Cannot preserve executable.'
+            cp -p -- "$SELF" "$old" || fail "Cannot preserve executable: $old"
             printf 'Previous executable retained: %s\n' "$old"
             if ! cmp -s "$timer" <(timer_unit); then
-                staged_timer=$(mktemp "${timer}.new.XXXXXXXX")
-                timer_unit > "$staged_timer"
-                old_timer=$(mktemp "${timer}.previous.XXXXXXXX")
-                cp -p -- "$timer" "$old_timer"
+                staged_timer=$(mktemp "${timer}.new.XXXXXXXX") || fail 'Cannot stage timer.'
+                timer_unit > "$staged_timer" || fail 'Cannot stage timer.'
+                old_timer=$(mktemp "${timer}.previous.XXXXXXXX") || fail 'Cannot preserve timer.'
+                cp -p -- "$timer" "$old_timer" || fail "Cannot preserve timer: $old_timer"
                 printf 'Previous timer retained: %s\n' "$old_timer"
-                mv -f -- "$staged_timer" "$timer"
+            fi
+            timer_state=$(systemctl show --property=ActiveState --value eylan-backup.timer) || fail 'Cannot inspect timer state.'
+            [[ $timer_state == active || $timer_state == inactive ]] || fail "Unexpected timer state: $timer_state"
+            transaction=1
+            if [[ $timer_state == active ]]; then
+                systemctl stop eylan-backup.timer || fail 'Could not stop timer.'
+            fi
+            service_state=$(systemctl show --property=ActiveState --value eylan-backup.service) || fail 'Cannot inspect backup service state.'
+            [[ $service_state == inactive || $service_state == failed ]] || fail 'Backup service is active; retry after it finishes.'
+            if [[ -n $staged_timer ]]; then
+                timer_changed=1
+                mv -f -- "$staged_timer" "$timer" || fail 'Cannot install timer.'
                 staged_timer=''
             fi
-            mv -f -- "$staged" "$SELF"
-        )
-        systemctl daemon-reload || fail 'Update installed, but systemd reload failed; inspect retained files and restart the timer manually.'
-        exec 9>&-
-        systemctl enable --now eylan-backup.timer || fail 'Update installed, but timer activation failed; inspect systemd status.'
+            self_changed=1
+            mv -f -- "$staged" "$SELF" || fail 'Cannot install executable.'
+            staged=''
+            systemctl daemon-reload || fail 'Cannot reload systemd.'
+            if [[ $timer_state == active ]]; then
+                lock_released=1
+                exec 9>&- || fail 'Cannot release backup lock.'
+                systemctl start eylan-backup.timer || fail 'Cannot restore timer activity.'
+            fi
+            transaction=0
+            trap - EXIT INT TERM HUP
+        if (( ! lock_released )); then exec 9>&- || fail 'Cannot release backup lock.'; fi
         printf '%s\n' 'Update installed. Check the timer and service journal.'
         return
     fi

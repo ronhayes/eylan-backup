@@ -8,17 +8,13 @@
 
 روی سرور مقصد با دسترسی root اجرا کنید. ابزارهای `systemd`, `gpg`, `openssl`, `python3`, `curl`, `tar`, `flock` و کلاینت PostgreSQL لازم‌اند؛ کاربر سیستم `postgres`، دیتابیس و نقش `eylan_user` باید موجود باشند. دسترسی مدیر محلی PostgreSQL برای `postgres` لازم است.
 
-برای دانلود و نصب روی **سرور آزمایشی**، ابتدا فایل را از مخزن دریافت کنید:
+برای دریافت اسکریپت و بازشدن خودکار منو روی **سرور آزمایشی**، دستور زیر را اجرا کنید. این دستور کد شاخه `main` را بلافاصله با دسترسی مدیر اجرا می‌کند؛ پیش از اجرا به محتوای مخزن اعتماد کنید:
 
 ```bash
-wget -O eylan-backup.sh https://raw.githubusercontent.com/ronhayes/eylan-backup/main/eylan-backup.sh
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/ronhayes/eylan-backup/main/eylan-backup.sh -o "$f" && sudo bash "$f"
 ```
 
-محتوای فایل دانلودشده را بررسی کنید، سپس منو را اجرا کنید:
-
-```bash
-sudo bash eylan-backup.sh
-```
+برای بررسی اسکریپت پیش از اجرا، به‌جای دستور بالا آن را جداگانه دانلود کنید، محتوایش را ببینید و سپس با `sudo bash` اجرا کنید.
 
 پس از نصب، برای اجرای دوباره منو:
 

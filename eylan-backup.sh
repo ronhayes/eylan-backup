@@ -102,6 +102,8 @@ if not isinstance(result, dict) or result.get('ok') is not True:
     raise SystemExit(1)
 PY
     printf '%s\n' 'Upload to Telegram confirmed.'
+    rm -- "$archive"
+    printf '%s\n' 'Uploaded local backup removed.'
     rm -rf -- "$work"
     trap - EXIT
 }

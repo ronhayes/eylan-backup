@@ -8,8 +8,22 @@
 
 روی سرور مقصد با دسترسی root اجرا کنید. ابزارهای `systemd`, `gpg`, `openssl`, `python3`, `curl`, `tar`, `flock` و کلاینت PostgreSQL لازم‌اند؛ کاربر سیستم `postgres`، دیتابیس و نقش `eylan_user` باید موجود باشند. دسترسی مدیر محلی PostgreSQL برای `postgres` لازم است.
 
+برای دانلود و نصب روی **سرور آزمایشی**، ابتدا فایل را از مخزن دریافت کنید:
+
+```bash
+wget -O eylan-backup.sh https://raw.githubusercontent.com/ronhayes/eylan-backup/main/eylan-backup.sh
+```
+
+محتوای فایل دانلودشده را بررسی کنید، سپس منو را اجرا کنید:
+
 ```bash
 sudo bash eylan-backup.sh
+```
+
+پس از نصب، برای اجرای دوباره منو:
+
+```bash
+sudo /usr/local/sbin/eylan-backup
 ```
 
 گزینه ۱ را انتخاب کنید و توکن ربات و شناسه عددی چت را وارد کنید. ابتدا به ربات پیام بدهید و دسترسی آن به چت را بررسی کنید. نصب پس از تأیید، تایمر `eylan-backup.timer` را فعال می‌کند. وضعیت و خطاها:

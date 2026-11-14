@@ -24,28 +24,95 @@ check_key() {
 gpg_encrypt() { gpg --no-options --batch --yes --pinentry-mode loopback --passphrase-file "$KEY" --symmetric --cipher-algo AES256 --output "$1"; }
 gpg_decrypt() { gpg --no-options --batch --yes --pinentry-mode loopback --passphrase-file "$KEY" --decrypt "$1"; }
 
+service_unit() { printf '%s\n' '[Unit]' 'Description=Encrypted Eylan panel backup' '[Service]' 'Type=oneshot' "ExecStart=$SELF --backup"; }
+old_timer_unit() { printf '%s\n' '[Unit]' 'Description=Hourly Eylan backup' '[Timer]' 'OnCalendar=hourly' 'Persistent=true' 'Unit=eylan-backup.service' '[Install]' 'WantedBy=timers.target'; }
+timer_unit() { printf '%s\n' '[Unit]' 'Description=Hourly Eylan backup' '[Timer]' 'OnActiveSec=1h' 'OnUnitInactiveSec=1h' 'Unit=eylan-backup.service' '[Install]' 'WantedBy=timers.target'; }
+
 setup() {
-    need systemctl install openssl gpg python3 curl runuser pg_dump pg_restore psql createdb flock stat mktemp tar
-    [[ ! -e $SELF && ! -e /etc/systemd/system/eylan-backup.service && ! -e /etc/systemd/system/eylan-backup.timer && ! -e $CREDS ]] || fail 'A previous installation or file with the same name exists; no automatic overwrite will occur.'
+    need systemctl install openssl gpg python3 curl runuser pg_dump pg_restore psql createdb flock stat mktemp tar cmp cp mv chmod bash grep
+    local service=/etc/systemd/system/eylan-backup.service timer=/etc/systemd/system/eylan-backup.timer
+    local token chat dropins fragment dir name unit
+    for dir in "$CONFIG" "$BASE"; do
+        if [[ -e $dir || -L $dir ]]; then
+            [[ -d $dir && ! -L $dir && $(stat -c '%u:%a' "$dir") == 0:700 ]] || fail "Unsafe existing directory: $dir"
+        fi
+    done
+    local -a credentials
+    [[ -f $0 && ! -L $0 ]] || fail 'Run a regular downloaded script file.'
+    lock
+    if [[ -e $KEY || -L $KEY ]]; then check_key; [[ -s $KEY ]] || fail 'Existing key is empty.'; fi
+    if [[ -e $SELF || -L $SELF || -e $service || -L $service || -e $timer || -L $timer || -e $CREDS || -L $CREDS ]]; then
+        # Accept only the exact units created by this installer; custom units need manual review.
+        [[ -d $CONFIG && ! -L $CONFIG && $(stat -c '%u:%a' "$CONFIG") == 0:700 && -d $BASE && ! -L $BASE && $(stat -c '%u:%a' "$BASE") == 0:700 ]] || fail 'Incomplete or unsafe installation; inspect it manually.'
+        check_key
+        [[ -s $KEY && -f $CREDS && ! -L $CREDS && $(stat -c '%u:%a' "$CREDS") == 0:600 ]] || fail 'Incomplete or unsafe credentials; inspect the installation manually.'
+        mapfile -t credentials < "$CREDS"
+        [[ ${#credentials[@]} == 2 && ${credentials[0]} =~ ^[0-9]+:[A-Za-z0-9_-]+$ && ${credentials[1]} =~ ^-?[0-9]+$ ]] || fail 'Invalid credentials; inspect the installation manually.'
+        unset credentials
+        [[ -f $SELF && ! -L $SELF && $(stat -c '%u:%a' "$SELF") == 0:700 && -f $service && ! -L $service && $(stat -c '%u:%a' "$service") == 0:600 && -f $timer && ! -L $timer && $(stat -c '%u:%a' "$timer") == 0:600 ]] || fail 'Incomplete or unsafe installation files; inspect them manually.'
+        cmp -s "$service" <(service_unit) || fail 'Unrecognized service unit; inspect it manually.'
+        if ! cmp -s "$timer" <(old_timer_unit) && ! cmp -s "$timer" <(timer_unit); then fail 'Unrecognized timer unit; inspect it manually.'; fi
+        [[ ! $0 -ef $SELF ]] || fail 'Already running the installed executable; download the new script and run that instead.'
+        for unit in eylan-backup.service eylan-backup.timer; do
+            fragment=$(systemctl show --property=FragmentPath --value "$unit") || fail 'Cannot inspect systemd unit.'
+            dropins=$(systemctl show --property=DropInPaths --value "$unit") || fail 'Cannot inspect systemd drop-ins.'
+            [[ $fragment == "/etc/systemd/system/$unit" && -z $dropins ]] || fail 'Systemd unit overrides exist; inspect them manually before updating.'
+        done
+        # A timer run must not start while this process holds the backup lock.
+        if systemctl is-active --quiet eylan-backup.service; then fail 'Backup service is active; retry after it finishes.'; fi
+        printf '%s\n' 'Update the executable and timer? Existing key, credentials, database and backups will not be changed.'
+        confirm
+        systemctl stop eylan-backup.timer || fail 'Could not stop timer; no files were replaced.'
+        (
+            local staged old staged_timer old_timer
+            staged=$(mktemp "${SELF}.new.XXXXXXXX")
+            staged_timer=''
+            trap 'rm -f -- "$staged" ${staged_timer:+"$staged_timer"}' EXIT
+            install -m 700 -- "$0" "$staged"
+            bash -n "$staged" || fail 'Downloaded script has invalid Bash syntax.'
+            old=$(mktemp "${SELF}.previous.XXXXXXXX")
+            cp -p -- "$SELF" "$old"
+            printf 'Previous executable retained: %s\n' "$old"
+            if ! cmp -s "$timer" <(timer_unit); then
+                staged_timer=$(mktemp "${timer}.new.XXXXXXXX")
+                timer_unit > "$staged_timer"
+                old_timer=$(mktemp "${timer}.previous.XXXXXXXX")
+                cp -p -- "$timer" "$old_timer"
+                printf 'Previous timer retained: %s\n' "$old_timer"
+                mv -f -- "$staged_timer" "$timer"
+                staged_timer=''
+            fi
+            mv -f -- "$staged" "$SELF"
+        )
+        systemctl daemon-reload || fail 'Update installed, but systemd reload failed; inspect retained files and restart the timer manually.'
+        exec 9>&-
+        systemctl enable --now eylan-backup.timer || fail 'Update installed, but timer activation failed; inspect systemd status.'
+        printf '%s\n' 'Update installed. Check the timer and service journal.'
+        return
+    fi
     printf '%s\n' 'An hourly timer will be installed, the token saved, and a local key created.'
     printf '%s\n' 'Keep the token and key separately and securely. No existing files will be overwritten.'
-    local token chat
     read -r -s -p 'Telegram bot token: ' token; printf '\n'
     read -r -p 'Telegram numeric chat ID: ' chat
     [[ $token =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || fail 'Invalid token format.'
     [[ $chat =~ ^-?[0-9]+$ ]] || fail 'The chat ID must be numeric.'
     confirm
-    lock
     install -d -m 700 "$CONFIG" "$BASE"
     if [[ -e $KEY || -L $KEY ]]; then check_key; else (set -o noclobber; openssl rand -base64 48 > "$KEY"); chmod 600 "$KEY"; fi
     (set -o noclobber; printf '%s\n%s\n' "$token" "$chat" > "$CREDS")
     unset token chat
+    (set -o noclobber; : > "$SELF")
     install -m 700 -- "$0" "$SELF"
-    (set -o noclobber; printf '%s\n' '[Unit]' 'Description=Encrypted Eylan panel backup' '[Service]' 'Type=oneshot' "ExecStart=$SELF --backup" > /etc/systemd/system/eylan-backup.service)
-    (set -o noclobber; printf '%s\n' '[Unit]' 'Description=Hourly Eylan backup' '[Timer]' 'OnCalendar=hourly' 'Persistent=true' 'Unit=eylan-backup.service' '[Install]' 'WantedBy=timers.target' > /etc/systemd/system/eylan-backup.timer)
-    systemctl daemon-reload
-    systemctl enable --now eylan-backup.timer
-    printf '%s\n' 'Timer enabled. Back up the key /etc/eylan-backup/passphrase separately and securely.'
+    (set -o noclobber; service_unit > "$service")
+    (set -o noclobber; timer_unit > "$timer")
+    systemctl daemon-reload || fail 'Installation incomplete: systemd reload failed; inspect files manually.'
+    systemctl enable eylan-backup.timer || fail 'Installation incomplete: timer enable failed; inspect systemd status.'
+    exec 9>&-
+    local first_status=0
+    systemctl start eylan-backup.service || first_status=$?
+    systemctl start eylan-backup.timer || fail 'Timer start failed; inspect systemd status and the first backup journal.'
+    (( first_status == 0 )) || fail 'First backup failed; inspect the service journal and any retained local backup.'
+    printf '%s\n' 'First backup service completed. Check the journal for upload confirmation. Back up the key /etc/eylan-backup/passphrase separately and securely.'
 }
 
 backup() {
